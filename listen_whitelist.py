@@ -11,6 +11,7 @@
     seq 必填（消息 id，原样回传），appId 必填（上游调用方标识），
     sendTime 建议带（ISO8601 或 epoch 秒/毫秒）；距今超过 send_max_delay_seconds
     （默认 7200，即 2h）则不发，但仍回结果（skipped=true）
+    指令同时缺 appId 和 seq → 直接丢弃，不回结果
   - 每条发送指令的结果投递到 kafka_send_result_topic：
     {"seq","appId","bot","who","ok","skipped","error","via","sendTime","delaySeconds","ts"}
 不做任何 AI 回复 / 关键词 / 转发逻辑。
@@ -316,7 +317,9 @@ def do_send(wx, registered, cmd, max_delay_seconds):
           "text": 可选, "at": str|list 可选, "files": list 可选}
     - who 已被监听时用子窗口 chat.SendMsg；否则退回主窗口 wx.SendMsg(who=...)。
     - sendTime 距当前时间超过 max_delay_seconds（默认 2h）则不发，但仍回结果。
-    返回结果 dict（原样回传 seq / appId / sendTime），由调用方投递到 result topic。
+    返回值：
+      dict  -> 发送结果，调用方投递到 result topic
+      None  -> 指令既无 appId 也无 seq，无法对齐结果，直接丢弃且不回结果
     """
     seq = cmd.get("seq")
     app_id = cmd.get("appId")
@@ -325,6 +328,12 @@ def do_send(wx, registered, cmd, max_delay_seconds):
     text = cmd.get("text")
     at = cmd.get("at") or None
     files = cmd.get("files") or None
+
+    has_seq = seq not in (None, "")
+    has_app = bool(str(app_id or "").strip())
+    if not has_seq and not has_app:
+        print(f"  ! 指令既无 appId 也无 seq，丢弃且不回结果: {cmd!r}", flush=True)
+        return None
 
     result = {
         "seq": seq,
@@ -340,12 +349,12 @@ def do_send(wx, registered, cmd, max_delay_seconds):
         "ts": datetime.now().isoformat(timespec="seconds"),
     }
 
-    if seq in (None, ""):
+    if not has_seq:
         result["skipped"] = True
         result["error"] = "missing 'seq'"
         print(f"  ! 指令缺 seq，已拒绝: {cmd!r}", flush=True)
         return result
-    if not app_id:
+    if not has_app:
         print(f"  ! 指令缺 appId（仍尝试发送）: {cmd!r}", flush=True)
     if not who:
         result["skipped"] = True
@@ -477,6 +486,8 @@ def main():
                     break
                 print(f"[{datetime.now():%H:%M:%S}] 收到发送指令: {cmd!r}")
                 res = do_send(wx, registered, cmd, max_delay)
+                if res is None:
+                    continue   # 无 appId 且无 seq：丢弃，不回结果
                 _sink.emit(res, topic=send_result_topic)   # 结果回投（含过期/校验失败）
                 if not res.get("skipped"):
                     time.sleep(0.5)
