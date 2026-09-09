@@ -19,8 +19,12 @@
     "AllListen_switch": false,
     "AllListen_filter_mute": true,
     "chat_listen_only": false,
-    "listen_list": ["示例联系人昵称"],
-    "group": ["示例群名称"],
+    "listen_list": [
+        "示例联系人昵称"
+    ],
+    "group": [
+        "示例群名称"
+    ],
     "group_api_map": {},
     "group_switch": false,
     "group_listen_only": false,
@@ -106,5 +110,7 @@
     "siver_panel_panel_url": "",
     "siver_panel_service_expire_at": "",
     "siver_panel_last_error_code": "",
-    "siver_panel_last_error_message": ""
+    "siver_panel_last_error_message": "",
+    "kafka_brokers": "kafka.mw.svc.dev.local:9092",
+    "kafka_topic": "com.jsecode.wxbot.messages.receive"
 }
