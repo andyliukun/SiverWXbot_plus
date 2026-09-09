@@ -15,24 +15,27 @@
     {"appId","id","bot","who","ok","skipped","error","via","sendTime","delaySeconds","ts"}
 不做任何 AI 回复 / 关键词 / 转发逻辑。
 
-监听名单不再取自 config.json，改为：
+配置文件 listen_whitelist.json（与本脚本同目录，独立于 config/config.json，
+不受 web_server.py / 面板影响；启动读一次，改动需重启）：
+  {
+    "kafka_brokers":            "kafka.mw.svc.dev.local:9092",
+    "kafka_topic":              "com.jsecode.wxbot.messages.receive",      # 入站消息
+    "kafka_send_topic":         "com.jsecode.wxbot.messages.send",         # 出站发送指令
+    "kafka_send_result_topic":  "com.jsecode.wxbot.messages.send.result",  # 发送结果
+    "kafka_group_id":           "wxbot-sender",
+    "send_max_delay_seconds":   7200,   # sendTime 距今超过则不发（仍回结果）
+    "redis_url":                "redis://redis.mw.svc.dev.local:6379/0",
+    "redis_listen_channel":     "com.jsecode.wxbot.listen.update",
+    "redis_password":           ""      # 也可直接写进 redis_url: redis://:pass@host:6379/0
+  }
+缺失的键用脚本内默认值。样板见 listen_whitelist.example.json。
+
+监听名单不来自任何配置文件：
   - 唯一来源是 Redis channel 下发的「全量快照」JSON：
       {"listen_list": ["联系人A"], "group": ["群1", "群2"]}
   - 每次收到快照，主线程 reconcile 监听并把快照写入本地状态文件
-      config/listen_targets.json
-  - 启动时先加载该状态文件，恢复上次的监听名单；文件不存在则空跑，
-    等第一条 Redis 快照
-
-Kafka / Redis 连接配置仍从 config.json 读（启动读一次，改动需重启）：
-  "kafka_brokers":        "kafka.mw.svc.dev.local:9092",
-  "kafka_topic":              "com.jsecode.wxbot.messages.receive",       # 入站消息
-  "kafka_send_topic":         "com.jsecode.wxbot.messages.send",          # 出站发送指令
-  "kafka_send_result_topic":  "com.jsecode.wxbot.messages.send.result",   # 发送结果
-  "kafka_group_id":           "wxbot-sender",
-  "send_max_delay_seconds":   7200,   # sendTime 距今超过则不发（仍回结果）
-  "redis_url":            "redis://redis.mw.svc.dev.local:6379/0",
-  "redis_listen_channel": "com.jsecode.wxbot.listen.update",
-  "redis_password":       ""   # 也可直接写进 redis_url: redis://:pass@host:6379/0
+      listen_targets.json（与本脚本同目录）
+  - 启动时先加载该状态文件恢复上次名单；文件不存在则空跑，等第一条 Redis 快照
 
 用法：
     python listen_whitelist.py
@@ -50,8 +53,9 @@ import tempfile
 import time
 from datetime import datetime
 
-# 仅复用 wxbot_core 的配置加载器来读 kafka/redis 连接参数
-from wxbot_core import WXBotConfig
+# import wxbot_core 只为触发它对 wxautox 的 WxParam 调优（MESSAGE_HASH /
+# CHAT_WINDOW_SIZE 等），与主程序行为一致。不实例化 WXBotConfig，不碰 config.json。
+import wxbot_core  # noqa: F401
 
 # 直接使用 wxautox4，不走 WXBot 那套 AI/指令流水线
 from wxautox4 import WeChat
@@ -60,17 +64,29 @@ from kafka_sink import KafkaSink
 from kafka_source import KafkaSource
 from redis_control import RedisListenControl
 
-# config.json 未配置时的默认值
-DEFAULT_KAFKA_BROKERS = "kafka.mw.svc.dev.local:9092"
-DEFAULT_KAFKA_TOPIC = "com.jsecode.wxbot.messages.receive"                # 入站：收到的消息
-DEFAULT_KAFKA_SEND_TOPIC = "com.jsecode.wxbot.messages.send"              # 出站：发送指令
-DEFAULT_KAFKA_SEND_RESULT_TOPIC = "com.jsecode.wxbot.messages.send.result"  # 出站：发送结果
-DEFAULT_KAFKA_GROUP_ID = "wxbot-sender"
-DEFAULT_SEND_MAX_DELAY_SECONDS = 2 * 3600   # sendTime 距今超过这个值就不发
-DEFAULT_REDIS_URL = "redis://redis.mw.svc.dev.local:6379/0"
-DEFAULT_REDIS_CHANNEL = "com.jsecode.wxbot.listen.update"
 
-STATE_FILENAME = "listen_targets.json"   # 与 config.json 同目录
+def _base_dir():
+    """脚本所在目录；打包成 onefile 时为 exe 所在目录。"""
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(_base_dir(), "listen_whitelist.json")
+STATE_PATH = os.path.join(_base_dir(), "listen_targets.json")
+
+# listen_whitelist.json 未配置时的默认值
+DEFAULTS = {
+    "kafka_brokers": "kafka.mw.svc.dev.local:9092",
+    "kafka_topic": "com.jsecode.wxbot.messages.receive",              # 入站：收到的消息
+    "kafka_send_topic": "com.jsecode.wxbot.messages.send",            # 出站：发送指令
+    "kafka_send_result_topic": "com.jsecode.wxbot.messages.send.result",  # 出站：发送结果
+    "kafka_group_id": "wxbot-sender",
+    "send_max_delay_seconds": 2 * 3600,   # sendTime 距今超过这个值就不发
+    "redis_url": "redis://redis.mw.svc.dev.local:6379/0",
+    "redis_listen_channel": "com.jsecode.wxbot.listen.update",
+    "redis_password": "",
+}
 
 _sink = None          # KafkaSink 实例，main() 里初始化
 _bot_id = "?"         # 当前登录微信昵称，main() 里赋值
@@ -84,23 +100,37 @@ _target_q = queue.Queue()
 _send_q = queue.Queue()
 
 
+def load_config():
+    """读 listen_whitelist.json，缺失的键用 DEFAULTS 补齐。文件不存在也照跑。"""
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            cfg.update({k: v for k, v in data.items() if v not in (None, "")})
+    except FileNotFoundError:
+        print(f"[config] {CONFIG_PATH} 不存在，全部用默认值", flush=True)
+    except Exception as e:
+        print(f"[config] 读取 {CONFIG_PATH} 失败，全部用默认值: {e!r}", flush=True)
+    return cfg
+
+
 def kafka_settings(cfg):
-    """从 config.json 读 kafka 配置，缺省用默认值。"""
-    raw = cfg.config
-    brokers = (raw.get("kafka_brokers") or "").strip() or DEFAULT_KAFKA_BROKERS
-    topic = (raw.get("kafka_topic") or "").strip() or DEFAULT_KAFKA_TOPIC
-    send_topic = (raw.get("kafka_send_topic") or "").strip() or DEFAULT_KAFKA_SEND_TOPIC
-    send_result_topic = (raw.get("kafka_send_result_topic") or "").strip() or DEFAULT_KAFKA_SEND_RESULT_TOPIC
-    group_id = (raw.get("kafka_group_id") or "").strip() or DEFAULT_KAFKA_GROUP_ID
-    return brokers, topic, send_topic, send_result_topic, group_id
+    """从 listen_whitelist.json 取 kafka 相关配置。"""
+    return (
+        str(cfg["kafka_brokers"]).strip(),
+        str(cfg["kafka_topic"]).strip(),
+        str(cfg["kafka_send_topic"]).strip(),
+        str(cfg["kafka_send_result_topic"]).strip(),
+        str(cfg["kafka_group_id"]).strip(),
+    )
 
 
 def redis_settings(cfg):
-    """从 config.json 读 redis 配置，缺省用默认值。"""
-    raw = cfg.config
-    url = (raw.get("redis_url") or "").strip() or DEFAULT_REDIS_URL
-    channel = (raw.get("redis_listen_channel") or "").strip() or DEFAULT_REDIS_CHANNEL
-    password = (raw.get("redis_password") or "").strip() or None
+    """从 listen_whitelist.json 取 redis 相关配置。"""
+    url = str(cfg["redis_url"]).strip()
+    channel = str(cfg["redis_listen_channel"]).strip()
+    password = (str(cfg.get("redis_password") or "").strip()) or None
     return url, channel, password
 
 
@@ -367,8 +397,9 @@ def do_send(wx, registered, cmd, max_delay_seconds):
 def main():
     global _sink, _bot_id
 
-    cfg = WXBotConfig()
-    state_path = os.path.join(os.path.dirname(cfg.CONFIG_FILE), STATE_FILENAME)
+    cfg = load_config()
+    state_path = STATE_PATH
+    print(f"配置文件 {CONFIG_PATH}")
 
     # 启动：先从状态文件恢复上次的监听名单
     init_listen, init_group = load_state(state_path)
@@ -383,9 +414,9 @@ def main():
 
     brokers, topic, send_topic, send_result_topic, group_id = kafka_settings(cfg)
     try:
-        max_delay = int(cfg.config.get("send_max_delay_seconds") or DEFAULT_SEND_MAX_DELAY_SECONDS)
+        max_delay = int(cfg.get("send_max_delay_seconds") or DEFAULTS["send_max_delay_seconds"])
     except (TypeError, ValueError):
-        max_delay = DEFAULT_SEND_MAX_DELAY_SECONDS
+        max_delay = DEFAULTS["send_max_delay_seconds"]
     print(f"Kafka -> brokers={brokers}")
     print(f"  入站消息 topic={topic}")
     print(f"  出站指令 topic={send_topic}  group.id={group_id}")
