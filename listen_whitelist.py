@@ -6,13 +6,13 @@
 用 wxautox4 的回调推送模式监听指定联系人/群：
   - 收到的消息 → 打印 + 异步投递到 Kafka 入站 topic（kafka_sink.py）
   - 消费 Kafka 出站 topic 的发送指令 → 主线程 chat.SendMsg（kafka_source.py）
-    指令：{"appId": "crm", "id": "req-1", "who": "张三", "sendTime": "2026-09-09T17:00:00",
+    指令：{"seq": "123", "appId": "crm", "who": "张三", "sendTime": "2026-09-09T17:00:00",
            "text": "你好", "at": ["李四"], "files": ["D:/a.png"]}
-    appId 必填（上游调用方标识），id 可选（相关性 id），
+    seq 必填（消息 id，原样回传），appId 必填（上游调用方标识），
     sendTime 建议带（ISO8601 或 epoch 秒/毫秒）；距今超过 send_max_delay_seconds
     （默认 7200，即 2h）则不发，但仍回结果（skipped=true）
   - 每条发送指令的结果投递到 kafka_send_result_topic：
-    {"appId","id","bot","who","ok","skipped","error","via","sendTime","delaySeconds","ts"}
+    {"seq","appId","bot","who","ok","skipped","error","via","sendTime","delaySeconds","ts"}
 不做任何 AI 回复 / 关键词 / 转发逻辑。
 
 配置文件 listen_whitelist.json（与本脚本同目录，独立于 config/config.json，
@@ -312,14 +312,14 @@ def _parse_send_time(v):
 def do_send(wx, registered, cmd, max_delay_seconds):
     """
     执行一条来自 Kafka 出站 topic 的发送指令。只在主线程调。
-    cmd: {"appId": 必填, "id": 可选, "who": 必填, "sendTime": 建议带,
+    cmd: {"seq": 必填(消息id), "appId": 必填, "who": 必填, "sendTime": 建议带,
           "text": 可选, "at": str|list 可选, "files": list 可选}
     - who 已被监听时用子窗口 chat.SendMsg；否则退回主窗口 wx.SendMsg(who=...)。
     - sendTime 距当前时间超过 max_delay_seconds（默认 2h）则不发，但仍回结果。
-    返回结果 dict（原样回传 appId / id / sendTime），由调用方投递到 result topic。
+    返回结果 dict（原样回传 seq / appId / sendTime），由调用方投递到 result topic。
     """
+    seq = cmd.get("seq")
     app_id = cmd.get("appId")
-    req_id = cmd.get("id")
     send_time = cmd.get("sendTime")
     who = str(cmd.get("who") or "").strip()
     text = cmd.get("text")
@@ -327,8 +327,8 @@ def do_send(wx, registered, cmd, max_delay_seconds):
     files = cmd.get("files") or None
 
     result = {
+        "seq": seq,
         "appId": app_id,
-        "id": req_id,
         "bot": _bot_id,
         "who": who,
         "ok": False,
@@ -340,6 +340,11 @@ def do_send(wx, registered, cmd, max_delay_seconds):
         "ts": datetime.now().isoformat(timespec="seconds"),
     }
 
+    if seq in (None, ""):
+        result["skipped"] = True
+        result["error"] = "missing 'seq'"
+        print(f"  ! 指令缺 seq，已拒绝: {cmd!r}", flush=True)
+        return result
     if not app_id:
         print(f"  ! 指令缺 appId（仍尝试发送）: {cmd!r}", flush=True)
     if not who:
