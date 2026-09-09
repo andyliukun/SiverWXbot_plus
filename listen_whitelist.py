@@ -6,7 +6,11 @@
 用 wxautox4 的回调推送模式监听指定联系人/群：
   - 收到的消息 → 打印 + 异步投递到 Kafka 入站 topic（kafka_sink.py）
   - 消费 Kafka 出站 topic 的发送指令 → 主线程 chat.SendMsg（kafka_source.py）
-    指令格式：{"who": "张三", "text": "你好", "at": ["李四"], "files": ["D:/a.png"]}
+    指令：{"appId": "crm", "id": "req-1", "who": "张三",
+           "text": "你好", "at": ["李四"], "files": ["D:/a.png"]}
+    appId 必填（上游调用方标识），id 可选（相关性 id）
+  - 每条发送指令的结果投递到 kafka_send_result_topic：
+    {"appId","id","bot","who","ok","error","via","ts"}
 不做任何 AI 回复 / 关键词 / 转发逻辑。
 
 监听名单不再取自 config.json，改为：
@@ -19,9 +23,10 @@
 
 Kafka / Redis 连接配置仍从 config.json 读（启动读一次，改动需重启）：
   "kafka_brokers":        "kafka.mw.svc.dev.local:9092",
-  "kafka_topic":          "com.jsecode.wxbot.messages.receive",   # 入站
-  "kafka_send_topic":     "com.jsecode.wxbot.messages.send",      # 出站（发送指令）
-  "kafka_group_id":       "wxbot-sender",
+  "kafka_topic":              "com.jsecode.wxbot.messages.receive",       # 入站消息
+  "kafka_send_topic":         "com.jsecode.wxbot.messages.send",          # 出站发送指令
+  "kafka_send_result_topic":  "com.jsecode.wxbot.messages.send.result",   # 发送结果
+  "kafka_group_id":           "wxbot-sender",
   "redis_url":            "redis://redis.mw.svc.dev.local:6379/0",
   "redis_listen_channel": "com.jsecode.wxbot.listen.update",
   "redis_password":       ""   # 也可直接写进 redis_url: redis://:pass@host:6379/0
@@ -54,8 +59,9 @@ from redis_control import RedisListenControl
 
 # config.json 未配置时的默认值
 DEFAULT_KAFKA_BROKERS = "kafka.mw.svc.dev.local:9092"
-DEFAULT_KAFKA_TOPIC = "com.jsecode.wxbot.messages.receive"          # 入站：收到的消息
-DEFAULT_KAFKA_SEND_TOPIC = "com.jsecode.wxbot.messages.send"        # 出站：发送指令
+DEFAULT_KAFKA_TOPIC = "com.jsecode.wxbot.messages.receive"                # 入站：收到的消息
+DEFAULT_KAFKA_SEND_TOPIC = "com.jsecode.wxbot.messages.send"              # 出站：发送指令
+DEFAULT_KAFKA_SEND_RESULT_TOPIC = "com.jsecode.wxbot.messages.send.result"  # 出站：发送结果
 DEFAULT_KAFKA_GROUP_ID = "wxbot-sender"
 DEFAULT_REDIS_URL = "redis://redis.mw.svc.dev.local:6379/0"
 DEFAULT_REDIS_CHANNEL = "com.jsecode.wxbot.listen.update"
@@ -80,8 +86,9 @@ def kafka_settings(cfg):
     brokers = (raw.get("kafka_brokers") or "").strip() or DEFAULT_KAFKA_BROKERS
     topic = (raw.get("kafka_topic") or "").strip() or DEFAULT_KAFKA_TOPIC
     send_topic = (raw.get("kafka_send_topic") or "").strip() or DEFAULT_KAFKA_SEND_TOPIC
+    send_result_topic = (raw.get("kafka_send_result_topic") or "").strip() or DEFAULT_KAFKA_SEND_RESULT_TOPIC
     group_id = (raw.get("kafka_group_id") or "").strip() or DEFAULT_KAFKA_GROUP_ID
-    return brokers, topic, send_topic, group_id
+    return brokers, topic, send_topic, send_result_topic, group_id
 
 
 def redis_settings(cfg):
@@ -246,15 +253,39 @@ def reconcile(wx, registered, want):
 def do_send(wx, registered, cmd):
     """
     执行一条来自 Kafka 出站 topic 的发送指令。只在主线程调。
-    cmd: {"who": 必填, "text": 可选, "at": str|list 可选, "files": list 可选}
+    cmd: {"appId": 必填, "id": 可选, "who": 必填,
+          "text": 可选, "at": str|list 可选, "files": list 可选}
     who 已被监听时用子窗口 chat.SendMsg；否则退回主窗口 wx.SendMsg(who=...)。
+    返回结果 dict（原样回传 appId / id），由调用方投递到 result topic。
     """
+    app_id = cmd.get("appId")
+    req_id = cmd.get("id")
     who = str(cmd.get("who") or "").strip()
-    if not who:
-        return
     text = cmd.get("text")
     at = cmd.get("at") or None
     files = cmd.get("files") or None
+
+    result = {
+        "appId": app_id,
+        "id": req_id,
+        "bot": _bot_id,
+        "who": who,
+        "ok": False,
+        "error": None,
+        "via": None,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    if not app_id:
+        print(f"  ! 指令缺 appId（仍尝试发送）: {cmd!r}", flush=True)
+    if not who:
+        result["error"] = "missing 'who'"
+        print(f"  ! 指令缺 who，已拒绝: {cmd!r}", flush=True)
+        return result
+    if not text and not files:
+        result["error"] = "empty: no 'text' or 'files'"
+        print(f"  ! 指令无 text/files，已拒绝: {cmd!r}", flush=True)
+        return result
 
     sub = None
     if who in registered:
@@ -262,6 +293,7 @@ def do_send(wx, registered, cmd):
             sub = wx.GetSubWindow(nickname=who)
         except Exception:
             sub = None
+    result["via"] = "subwindow" if sub else "mainwindow"
 
     try:
         if files:
@@ -274,10 +306,12 @@ def do_send(wx, registered, cmd):
                 sub.SendMsg(msg=text, at=at) if at else sub.SendMsg(text)
             else:
                 wx.SendMsg(msg=text, who=who, at=at) if at else wx.SendMsg(msg=text, who=who)
-        tag = "子窗口" if sub else "主窗口"
-        print(f"  → 已发送到 {who}（{tag}）: text={text!r} at={at} files={files}", flush=True)
+        result["ok"] = True
+        print(f"  → 已发送到 {who}（{result['via']}）: text={text!r} at={at} files={files}", flush=True)
     except Exception as e:
+        result["error"] = repr(e)
         print(f"  ! 发送到 {who} 失败: {e!r}", flush=True)
+    return result
 
 
 def main():
@@ -297,10 +331,11 @@ def main():
     _bot_id = wx.nickname
     print(f"已连接微信：{wx.nickname}")
 
-    brokers, topic, send_topic, group_id = kafka_settings(cfg)
+    brokers, topic, send_topic, send_result_topic, group_id = kafka_settings(cfg)
     print(f"Kafka -> brokers={brokers}")
-    print(f"  入站 topic={topic}")
-    print(f"  出站 topic={send_topic}  group.id={group_id}")
+    print(f"  入站消息 topic={topic}")
+    print(f"  出站指令 topic={send_topic}  group.id={group_id}")
+    print(f"  发送结果 topic={send_result_topic}")
     _sink = KafkaSink(brokers=brokers, topic=topic)
     _sink.start()
 
@@ -350,7 +385,8 @@ def main():
                 except queue.Empty:
                     break
                 print(f"[{datetime.now():%H:%M:%S}] 收到发送指令: {cmd!r}")
-                do_send(wx, registered, cmd)
+                res = do_send(wx, registered, cmd)
+                _sink.emit(res, topic=send_result_topic)   # 结果回投
                 time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n收到退出信号，停止监听...")

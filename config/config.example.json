@@ -2,6 +2,7 @@
     "kafka_brokers": "kafka.mw.svc.dev.local:9092",
     "kafka_topic": "com.jsecode.wxbot.messages.receive",
     "kafka_send_topic": "com.jsecode.wxbot.messages.send",
+    "kafka_send_result_topic": "com.jsecode.wxbot.messages.send.result",
     "kafka_group_id": "wxbot-sender",
     "redis_url": "redis://redis.mw.svc.dev.local:6379/0",
     "redis_listen_channel": "com.jsecode.wxbot.listen.update",

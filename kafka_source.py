@@ -4,13 +4,17 @@
 消费 Kafka 出站 topic 的「发送指令」，回调交给主线程执行 chat.SendMsg。
 
 指令格式（JSON，一条一个）：
-    {"who": "张三", "text": "你好"}
-    {"who": "项目群", "text": "通知一下", "at": ["李四", "王五"]}
-    {"who": "张三", "files": ["D:/a.png", "D:/b.pdf"]}
+    {"appId": "crm", "id": "req-123", "who": "张三", "text": "你好"}
+    {"appId": "crm", "who": "项目群", "text": "通知一下", "at": ["李四", "王五"]}
+    {"appId": "crm", "who": "张三", "files": ["D:/a.png", "D:/b.pdf"]}
+  appId 必填，上游调用方标识（会原样回传到 result topic）
+  id    可选，调用方自定义的相关性 id（回传，用于对齐请求与结果）
   who   必填，联系人或群名（需与微信里一致）
   text  可选，文本
   at    可选，str 或 list，仅群聊有效
   files 可选，list，图片/文件/视频路径
+
+发送结果会投递到 <topic>.result（见 listen_whitelist.py）。
 
 用法：
     from kafka_source import KafkaSource
@@ -96,9 +100,10 @@ class KafkaSource:
         except Exception as e:
             print(f"[KafkaSource] 指令解析失败: {e!r}  raw={raw!r}", flush=True)
             return
-        if not isinstance(cmd, dict) or not str(cmd.get("who") or "").strip():
-            print(f"[KafkaSource] 忽略无效指令（缺 who）: {cmd!r}", flush=True)
+        if not isinstance(cmd, dict):
+            print(f"[KafkaSource] 忽略非对象指令: {cmd!r}", flush=True)
             return
+        # 字段校验交给主线程 do_send，那里能把校验失败也发到 result topic
         try:
             self.on_command(cmd)
         except Exception as e:
