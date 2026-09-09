@@ -1,7 +1,4 @@
 {
-    "AllListen_switch": false,
-    "listen_list": ["示例联系人昵称"],
-    "group": ["示例群名称"],
     "kafka_brokers": "kafka.mw.svc.dev.local:9092",
     "kafka_topic": "com.jsecode.wxbot.messages.receive",
     "redis_url": "redis://redis.mw.svc.dev.local:6379/0",
