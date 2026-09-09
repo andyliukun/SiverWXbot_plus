@@ -8,6 +8,7 @@ wxautox_activate.py
 CLAUDE.md
 
 .claude/
+.idea/
 .venv
 venv/
 venv2/
