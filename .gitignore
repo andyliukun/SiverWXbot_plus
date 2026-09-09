@@ -19,7 +19,8 @@ dist/
 __pycache__/
 .pycache_verify/
 /releases/
-/config/
+/config/*
+!/config/config.example.json
 logs/
 wxauto_logs/
 panel_logs/
