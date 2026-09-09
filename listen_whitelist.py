@@ -6,11 +6,13 @@
 用 wxautox4 的回调推送模式监听指定联系人/群：
   - 收到的消息 → 打印 + 异步投递到 Kafka 入站 topic（kafka_sink.py）
   - 消费 Kafka 出站 topic 的发送指令 → 主线程 chat.SendMsg（kafka_source.py）
-    指令：{"appId": "crm", "id": "req-1", "who": "张三",
+    指令：{"appId": "crm", "id": "req-1", "who": "张三", "sendTime": "2026-09-09T17:00:00",
            "text": "你好", "at": ["李四"], "files": ["D:/a.png"]}
-    appId 必填（上游调用方标识），id 可选（相关性 id）
+    appId 必填（上游调用方标识），id 可选（相关性 id），
+    sendTime 建议带（ISO8601 或 epoch 秒/毫秒）；距今超过 send_max_delay_seconds
+    （默认 7200，即 2h）则不发，但仍回结果（skipped=true）
   - 每条发送指令的结果投递到 kafka_send_result_topic：
-    {"appId","id","bot","who","ok","error","via","ts"}
+    {"appId","id","bot","who","ok","skipped","error","via","sendTime","delaySeconds","ts"}
 不做任何 AI 回复 / 关键词 / 转发逻辑。
 
 监听名单不再取自 config.json，改为：
@@ -27,6 +29,7 @@ Kafka / Redis 连接配置仍从 config.json 读（启动读一次，改动需�
   "kafka_send_topic":         "com.jsecode.wxbot.messages.send",          # 出站发送指令
   "kafka_send_result_topic":  "com.jsecode.wxbot.messages.send.result",   # 发送结果
   "kafka_group_id":           "wxbot-sender",
+  "send_max_delay_seconds":   7200,   # sendTime 距今超过则不发（仍回结果）
   "redis_url":            "redis://redis.mw.svc.dev.local:6379/0",
   "redis_listen_channel": "com.jsecode.wxbot.listen.update",
   "redis_password":       ""   # 也可直接写进 redis_url: redis://:pass@host:6379/0
@@ -63,6 +66,7 @@ DEFAULT_KAFKA_TOPIC = "com.jsecode.wxbot.messages.receive"                # 入�
 DEFAULT_KAFKA_SEND_TOPIC = "com.jsecode.wxbot.messages.send"              # 出站：发送指令
 DEFAULT_KAFKA_SEND_RESULT_TOPIC = "com.jsecode.wxbot.messages.send.result"  # 出站：发送结果
 DEFAULT_KAFKA_GROUP_ID = "wxbot-sender"
+DEFAULT_SEND_MAX_DELAY_SECONDS = 2 * 3600   # sendTime 距今超过这个值就不发
 DEFAULT_REDIS_URL = "redis://redis.mw.svc.dev.local:6379/0"
 DEFAULT_REDIS_CHANNEL = "com.jsecode.wxbot.listen.update"
 
@@ -250,16 +254,43 @@ def reconcile(wx, registered, want):
         registered.discard(name)
 
 
-def do_send(wx, registered, cmd):
+def _parse_send_time(v):
+    """把 sendTime 解析成本地无时区 datetime；无法解析返回 None。
+    支持：ISO8601 字符串（可带 Z / 时区偏移）、epoch 秒、epoch 毫秒。"""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        sec = v / 1000.0 if v > 1e12 else float(v)
+        try:
+            return datetime.fromtimestamp(sec)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(v, str):
+        s = v.strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    return None
+
+
+def do_send(wx, registered, cmd, max_delay_seconds):
     """
     执行一条来自 Kafka 出站 topic 的发送指令。只在主线程调。
-    cmd: {"appId": 必填, "id": 可选, "who": 必填,
+    cmd: {"appId": 必填, "id": 可选, "who": 必填, "sendTime": 建议带,
           "text": 可选, "at": str|list 可选, "files": list 可选}
-    who 已被监听时用子窗口 chat.SendMsg；否则退回主窗口 wx.SendMsg(who=...)。
-    返回结果 dict（原样回传 appId / id），由调用方投递到 result topic。
+    - who 已被监听时用子窗口 chat.SendMsg；否则退回主窗口 wx.SendMsg(who=...)。
+    - sendTime 距当前时间超过 max_delay_seconds（默认 2h）则不发，但仍回结果。
+    返回结果 dict（原样回传 appId / id / sendTime），由调用方投递到 result topic。
     """
     app_id = cmd.get("appId")
     req_id = cmd.get("id")
+    send_time = cmd.get("sendTime")
     who = str(cmd.get("who") or "").strip()
     text = cmd.get("text")
     at = cmd.get("at") or None
@@ -271,21 +302,40 @@ def do_send(wx, registered, cmd):
         "bot": _bot_id,
         "who": who,
         "ok": False,
+        "skipped": False,          # True = 主动没发（过期 / 校验失败）
         "error": None,
         "via": None,
+        "sendTime": send_time,
+        "delaySeconds": None,
         "ts": datetime.now().isoformat(timespec="seconds"),
     }
 
     if not app_id:
         print(f"  ! 指令缺 appId（仍尝试发送）: {cmd!r}", flush=True)
     if not who:
+        result["skipped"] = True
         result["error"] = "missing 'who'"
         print(f"  ! 指令缺 who，已拒绝: {cmd!r}", flush=True)
         return result
     if not text and not files:
+        result["skipped"] = True
         result["error"] = "empty: no 'text' or 'files'"
         print(f"  ! 指令无 text/files，已拒绝: {cmd!r}", flush=True)
         return result
+
+    # ---- 过期检查 ----
+    dt = _parse_send_time(send_time)
+    if dt is None:
+        if send_time not in (None, ""):
+            print(f"  ! sendTime 无法解析（跳过过期检查）: {send_time!r}", flush=True)
+    else:
+        delay = (datetime.now() - dt).total_seconds()
+        result["delaySeconds"] = round(delay, 1)
+        if delay > max_delay_seconds:
+            result["skipped"] = True
+            result["error"] = f"stale: delay {int(delay)}s > {max_delay_seconds}s"
+            print(f"  ! 指令过期 {int(delay)}s（>{max_delay_seconds}s），不发送: who={who}", flush=True)
+            return result
 
     sub = None
     if who in registered:
@@ -332,10 +382,15 @@ def main():
     print(f"已连接微信：{wx.nickname}")
 
     brokers, topic, send_topic, send_result_topic, group_id = kafka_settings(cfg)
+    try:
+        max_delay = int(cfg.config.get("send_max_delay_seconds") or DEFAULT_SEND_MAX_DELAY_SECONDS)
+    except (TypeError, ValueError):
+        max_delay = DEFAULT_SEND_MAX_DELAY_SECONDS
     print(f"Kafka -> brokers={brokers}")
     print(f"  入站消息 topic={topic}")
     print(f"  出站指令 topic={send_topic}  group.id={group_id}")
     print(f"  发送结果 topic={send_result_topic}")
+    print(f"  指令过期阈值 send_max_delay_seconds={max_delay}")
     _sink = KafkaSink(brokers=brokers, topic=topic)
     _sink.start()
 
@@ -385,9 +440,10 @@ def main():
                 except queue.Empty:
                     break
                 print(f"[{datetime.now():%H:%M:%S}] 收到发送指令: {cmd!r}")
-                res = do_send(wx, registered, cmd)
-                _sink.emit(res, topic=send_result_topic)   # 结果回投
-                time.sleep(0.5)
+                res = do_send(wx, registered, cmd, max_delay)
+                _sink.emit(res, topic=send_result_topic)   # 结果回投（含过期/校验失败）
+                if not res.get("skipped"):
+                    time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n收到退出信号，停止监听...")
     finally:

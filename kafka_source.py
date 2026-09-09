@@ -4,15 +4,16 @@
 消费 Kafka 出站 topic 的「发送指令」，回调交给主线程执行 chat.SendMsg。
 
 指令格式（JSON，一条一个）：
-    {"appId": "crm", "id": "req-123", "who": "张三", "text": "你好"}
+    {"appId": "crm", "id": "req-123", "sendTime": "2026-09-09T17:00:00", "who": "张三", "text": "你好"}
     {"appId": "crm", "who": "项目群", "text": "通知一下", "at": ["李四", "王五"]}
     {"appId": "crm", "who": "张三", "files": ["D:/a.png", "D:/b.pdf"]}
-  appId 必填，上游调用方标识（会原样回传到 result topic）
-  id    可选，调用方自定义的相关性 id（回传，用于对齐请求与结果）
-  who   必填，联系人或群名（需与微信里一致）
-  text  可选，文本
-  at    可选，str 或 list，仅群聊有效
-  files 可选，list，图片/文件/视频路径
+  appId    必填，上游调用方标识（会原样回传到 result topic）
+  id       可选，调用方自定义的相关性 id（回传，用于对齐请求与结果）
+  sendTime 建议带，ISO8601 或 epoch 秒/毫秒；距今过久（默认 2h）则不发但仍回结果
+  who      必填，联系人或群名（需与微信里一致）
+  text     可选，文本
+  at       可选，str 或 list，仅群聊有效
+  files    可选，list，图片/文件/视频路径
 
 发送结果会投递到 <topic>.result（见 listen_whitelist.py）。
 
