@@ -9,10 +9,14 @@
 
 用法：
     from redis_control import RedisListenControl
-    ctl = RedisListenControl(url, channel, on_snapshot=lambda ll, gg: ...)
+    ctl = RedisListenControl(url, channel, on_snapshot=lambda ll, gg: ..., password="xxx")
     ctl.start()
     ...
     ctl.stop()
+
+password 单独传时优先于 url 里的密码；也可直接写进 url：
+    redis://:yourpassword@host:6379/0
+ACL 用户名（Redis 6+）请写进 url：redis://user:pass@host:6379/0
 
 回调 on_snapshot(listen_list, group) 在 Redis 订阅线程里执行，
 不要在回调里直接调 wxautox 的 UI API（跨线程）；应把目标集合丢进队列，
@@ -33,10 +37,11 @@ RECONNECT_DELAY = 5  # 秒
 
 
 class RedisListenControl:
-    def __init__(self, url, channel, on_snapshot):
+    def __init__(self, url, channel, on_snapshot, password=None):
         self.url = url
         self.channel = channel
         self.on_snapshot = on_snapshot
+        self.password = password or None
         self._stop = threading.Event()
         self._thread = None
 
@@ -58,11 +63,14 @@ class RedisListenControl:
         while not self._stop.is_set():
             client = pubsub = None
             try:
-                client = redis.Redis.from_url(
-                    self.url, decode_responses=True,
+                kwargs = dict(
+                    decode_responses=True,
                     socket_timeout=5, socket_keepalive=True,
                     health_check_interval=30,
                 )
+                if self.password:
+                    kwargs["password"] = self.password   # 优先于 url 里的密码
+                client = redis.Redis.from_url(self.url, **kwargs)
                 client.ping()
                 pubsub = client.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe(self.channel)

@@ -5,5 +5,6 @@
     "kafka_brokers": "kafka.mw.svc.dev.local:9092",
     "kafka_topic": "com.jsecode.wxbot.messages.receive",
     "redis_url": "redis://redis.mw.svc.dev.local:6379/0",
-    "redis_listen_channel": "com.jsecode.wxbot.listen.update"
+    "redis_listen_channel": "com.jsecode.wxbot.listen.update",
+    "redis_password": ""
 }

@@ -12,7 +12,8 @@ Kafka / Redis 配置（config.json，缺省用脚本内默认值，改动需重�
   "kafka_brokers":        "kafka.mw.svc.dev.local:9092",
   "kafka_topic":          "com.jsecode.wxbot.messages.receive",
   "redis_url":            "redis://redis.mw.svc.dev.local:6379/0",
-  "redis_listen_channel": "com.jsecode.wxbot.listen.update"
+  "redis_listen_channel": "com.jsecode.wxbot.listen.update",
+  "redis_password":       ""   # 也可直接写进 redis_url: redis://:pass@host:6379/0
 
 动态修改监听名单，三种方式（都是全量对账，无需重启）：
   1. 往 Redis channel 发全量快照 JSON：
@@ -75,7 +76,14 @@ def redis_settings(cfg):
     raw = cfg.config
     url = (raw.get("redis_url") or "").strip() or DEFAULT_REDIS_URL
     channel = (raw.get("redis_listen_channel") or "").strip() or DEFAULT_REDIS_CHANNEL
-    return url, channel
+    password = (raw.get("redis_password") or "").strip() or None
+    return url, channel, password
+
+
+def _mask_url(url):
+    """隐藏 url 里 user:pass@ 段，避免密码打进日志。"""
+    import re
+    return re.sub(r"://[^/@]*@", "://***@", url or "")
 
 
 def desired_targets(cfg):
@@ -201,15 +209,16 @@ def main():
     _sink = KafkaSink(brokers=brokers, topic=topic)
     _sink.start()
 
-    redis_url, redis_channel = redis_settings(cfg)
-    print(f"Redis -> url={redis_url}  channel={redis_channel}")
+    redis_url, redis_channel, redis_password = redis_settings(cfg)
+    _pw_hint = "（密码：url 内）" if not redis_password else "（密码：redis_password）"
+    print(f"Redis -> url={_mask_url(redis_url)}  channel={redis_channel} {_pw_hint}")
 
     def on_snapshot(listen_list, group):
         # 订阅线程回调：只把全量目标集合塞进队列，reconcile 交给主线程
         want = set(n for n in list(listen_list) + list(group) if n)
         _target_q.put(("redis", want))
 
-    control = RedisListenControl(redis_url, redis_channel, on_snapshot)
+    control = RedisListenControl(redis_url, redis_channel, on_snapshot, password=redis_password)
     control.start()
 
     wx.StopListening()
