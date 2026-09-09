@@ -8,11 +8,10 @@
   - 消费 Kafka 出站 topic 的发送指令 → 主线程 chat.SendMsg（kafka_source.py）
     指令：{"seq": "123", "appId": "crm", "who": "张三", "sendTime": "2026-09-09T17:00:00",
            "text": "你好", "at": ["李四"], "files": ["D:/a.png"]}
-    seq 必填（消息 id，原样回传），appId 必填（上游调用方标识），
+    seq / appId 必填；缺任一个仍尝试发送，但不回结果（无法对齐）
     sendTime 建议带（ISO8601 或 epoch 秒/毫秒）；距今超过 send_max_delay_seconds
-    （默认 7200，即 2h）则不发，但仍回结果（skipped=true）
-    指令同时缺 appId 和 seq → 直接丢弃，不回结果
-  - 每条发送指令的结果投递到 kafka_send_result_topic：
+    （默认 7200，即 2h）则不发
+  - 仅当 seq 和 appId 都有时，把结果投递到 kafka_send_result_topic：
     {"seq","appId","bot","who","ok","skipped","error","via","sendTime","delaySeconds","ts"}
 不做任何 AI 回复 / 关键词 / 转发逻辑。
 
@@ -316,10 +315,10 @@ def do_send(wx, registered, cmd, max_delay_seconds):
     cmd: {"seq": 必填(消息id), "appId": 必填, "who": 必填, "sendTime": 建议带,
           "text": 可选, "at": str|list 可选, "files": list 可选}
     - who 已被监听时用子窗口 chat.SendMsg；否则退回主窗口 wx.SendMsg(who=...)。
-    - sendTime 距当前时间超过 max_delay_seconds（默认 2h）则不发，但仍回结果。
+    - sendTime 距当前时间超过 max_delay_seconds（默认 2h）则不发。
     返回值：
-      dict  -> 发送结果，调用方投递到 result topic
-      None  -> 指令既无 appId 也无 seq，无法对齐结果，直接丢弃且不回结果
+      dict  -> seq 和 appId 都有：发送结果，调用方投递到 result topic
+      None  -> 缺 seq 或缺 appId：仍尝试发送，但无法对齐结果，不回结果
     """
     seq = cmd.get("seq")
     app_id = cmd.get("appId")
@@ -331,9 +330,10 @@ def do_send(wx, registered, cmd, max_delay_seconds):
 
     has_seq = seq not in (None, "")
     has_app = bool(str(app_id or "").strip())
-    if not has_seq and not has_app:
-        print(f"  ! 指令既无 appId 也无 seq，丢弃且不回结果: {cmd!r}", flush=True)
-        return None
+    report = has_seq and has_app   # 只有两者齐全才回结果到 result topic
+    if not report:
+        miss = "/".join(n for n, ok in (("appId", has_app), ("seq", has_seq)) if not ok)
+        print(f"  ! 指令缺 {miss}（仍尝试发送，但不回结果）: {cmd!r}", flush=True)
 
     result = {
         "seq": seq,
@@ -349,23 +349,19 @@ def do_send(wx, registered, cmd, max_delay_seconds):
         "ts": datetime.now().isoformat(timespec="seconds"),
     }
 
-    if not has_seq:
-        result["skipped"] = True
-        result["error"] = "missing 'seq'"
-        print(f"  ! 指令缺 seq，已拒绝: {cmd!r}", flush=True)
-        return result
-    if not has_app:
-        print(f"  ! 指令缺 appId（仍尝试发送）: {cmd!r}", flush=True)
+    def _ret():
+        return result if report else None
+
     if not who:
         result["skipped"] = True
         result["error"] = "missing 'who'"
-        print(f"  ! 指令缺 who，已拒绝: {cmd!r}", flush=True)
-        return result
+        print(f"  ! 指令缺 who，未发送: {cmd!r}", flush=True)
+        return _ret()
     if not text and not files:
         result["skipped"] = True
         result["error"] = "empty: no 'text' or 'files'"
-        print(f"  ! 指令无 text/files，已拒绝: {cmd!r}", flush=True)
-        return result
+        print(f"  ! 指令无 text/files，未发送: {cmd!r}", flush=True)
+        return _ret()
 
     # ---- 过期检查 ----
     dt = _parse_send_time(send_time)
@@ -379,7 +375,7 @@ def do_send(wx, registered, cmd, max_delay_seconds):
             result["skipped"] = True
             result["error"] = f"stale: delay {int(delay)}s > {max_delay_seconds}s"
             print(f"  ! 指令过期 {int(delay)}s（>{max_delay_seconds}s），不发送: who={who}", flush=True)
-            return result
+            return _ret()
 
     sub = None
     if who in registered:
@@ -405,7 +401,7 @@ def do_send(wx, registered, cmd, max_delay_seconds):
     except Exception as e:
         result["error"] = repr(e)
         print(f"  ! 发送到 {who} 失败: {e!r}", flush=True)
-    return result
+    return _ret()
 
 
 def main():
@@ -487,7 +483,7 @@ def main():
                 print(f"[{datetime.now():%H:%M:%S}] 收到发送指令: {cmd!r}")
                 res = do_send(wx, registered, cmd, max_delay)
                 if res is None:
-                    continue   # 无 appId 且无 seq：丢弃，不回结果
+                    continue   # 缺 seq 或 appId：已尝试发送，但不回结果
                 _sink.emit(res, topic=send_result_topic)   # 结果回投（含过期/校验失败）
                 if not res.get("skipped"):
                     time.sleep(0.5)
