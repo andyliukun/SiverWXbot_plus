@@ -7,3 +7,4 @@ wxautox4 >= 41.1.1
 cozepy
 websockets
 confluent-kafka
+redis

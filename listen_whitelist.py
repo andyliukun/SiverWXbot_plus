@@ -8,15 +8,20 @@
 注册监听，收到消息后打印，并异步投递到 Kafka（见 kafka_sink.py），
 不做任何 AI 回复 / 指令处理 / 转发。
 
-Kafka 配置（config.json，缺省用脚本内默认值，改动需重启）：
-  "kafka_brokers": "kafka.mw.svc.dev.local:9092",
-  "kafka_topic":   "com.jsecode.wxbot.messages.receive"
+Kafka / Redis 配置（config.json，缺省用脚本内默认值，改动需重启）：
+  "kafka_brokers":        "kafka.mw.svc.dev.local:9092",
+  "kafka_topic":          "com.jsecode.wxbot.messages.receive",
+  "redis_url":            "redis://redis.mw.svc.dev.local:6379/0",
+  "redis_listen_channel": "com.jsecode.wxbot.listen.update"
 
-动态修改：脚本会盯着 config/config.json，文件一变就重新读取，
-对比 listen_list + group 的差异，新增的 AddListenChat、移除的
-RemoveListenChat，无需重启。改法二选一：
-  - 打开面板 (python web_server.py) 在监听名单里增删；
-  - 或直接编辑 config/config.json 的 listen_list / group 后保存。
+动态修改监听名单，三种方式（都是全量对账，无需重启）：
+  1. 往 Redis channel 发全量快照 JSON：
+       {"listen_list": ["联系人A"], "group": ["群1", "群2"]}
+     订阅线程收到后交主线程 reconcile。
+  2. 直接编辑 config/config.json 的 listen_list / group 后保存（mtime 轮询）。
+  3. 打开面板 (python web_server.py) 在监听名单里增删（本质同 2）。
+Redis 快照与 config.json 是「谁后到谁生效」；收到快照后会刷新 mtime 基准，
+避免紧接着被 config.json 回滚。
 
 用法：
     python listen_whitelist.py
@@ -27,6 +32,7 @@ Ctrl+C 退出。
 """
 
 import os
+import queue
 import sys
 import time
 from datetime import datetime
@@ -38,23 +44,38 @@ from wxbot_core import WXBotConfig
 from wxautox4 import WeChat
 
 from kafka_sink import KafkaSink
+from redis_control import RedisListenControl
 
 POLL_INTERVAL = 3  # 秒，config.json 变更检测间隔
 
-# config.json 未配置时的默认值（键名：kafka_brokers / kafka_topic）
+# config.json 未配置时的默认值
 DEFAULT_KAFKA_BROKERS = "kafka.mw.svc.dev.local:9092"
 DEFAULT_KAFKA_TOPIC = "com.jsecode.wxbot.messages.receive"
+DEFAULT_REDIS_URL = "redis://redis.mw.svc.dev.local:6379/0"
+DEFAULT_REDIS_CHANNEL = "com.jsecode.wxbot.listen.update"
 
 _sink = None          # KafkaSink 实例，main() 里初始化
 _bot_id = "?"         # 当前登录微信昵称，main() 里赋值
 
+# Redis channel 下发的目标集合队列：订阅线程写，主线程读后 reconcile
+# （wxautox 的 AddListenChat/RemoveListenChat 必须在持有 WeChat 对象的主线程调）
+_target_q = queue.Queue()
+
 
 def kafka_settings(cfg):
-    """从 config.json 读 kafka 配置，缺省用上面的默认值。启动时读一次，改动需重启。"""
+    """从 config.json 读 kafka 配置，缺省用默认值。启动时读一次，改动需重启。"""
     raw = cfg.config
     brokers = (raw.get("kafka_brokers") or "").strip() or DEFAULT_KAFKA_BROKERS
     topic = (raw.get("kafka_topic") or "").strip() or DEFAULT_KAFKA_TOPIC
     return brokers, topic
+
+
+def redis_settings(cfg):
+    """从 config.json 读 redis 配置，缺省用默认值。启动时读一次，改动需重启。"""
+    raw = cfg.config
+    url = (raw.get("redis_url") or "").strip() or DEFAULT_REDIS_URL
+    channel = (raw.get("redis_listen_channel") or "").strip() or DEFAULT_REDIS_CHANNEL
+    return url, channel
 
 
 def desired_targets(cfg):
@@ -138,6 +159,17 @@ def remove_listen(wx, name):
         print(f"  ! 取消监听失败 {name}: {e!r}")
 
 
+def _drain_latest(q):
+    """取空队列，返回最后一个元素（没有则 None）。用于只应用最新的全量快照。"""
+    item = None
+    try:
+        while True:
+            item = q.get_nowait()
+    except queue.Empty:
+        pass
+    return item
+
+
 def reconcile(wx, registered, want):
     """把当前已注册集合 registered 调整为目标集合 want（原地修改 registered）。"""
     for name in [n for n in want if n not in registered]:
@@ -169,6 +201,17 @@ def main():
     _sink = KafkaSink(brokers=brokers, topic=topic)
     _sink.start()
 
+    redis_url, redis_channel = redis_settings(cfg)
+    print(f"Redis -> url={redis_url}  channel={redis_channel}")
+
+    def on_snapshot(listen_list, group):
+        # 订阅线程回调：只把全量目标集合塞进队列，reconcile 交给主线程
+        want = set(n for n in list(listen_list) + list(group) if n)
+        _target_q.put(("redis", want))
+
+    control = RedisListenControl(redis_url, redis_channel, on_snapshot)
+    control.start()
+
     wx.StopListening()
     time.sleep(1)
     wx.StartListening()
@@ -180,13 +223,35 @@ def main():
         last_mtime = os.path.getmtime(config_path)
     except OSError:
         last_mtime = 0
+    last_cfg_check = 0.0
 
     print(f"\n开始监听，当前 {len(registered)} 个对象：{sorted(registered)}")
-    print(f"（改 {config_path} 的 listen_list / group 即可动态增删；Ctrl+C 退出）\n")
+    print(f"（改 {config_path} 的 listen_list / group，或往 Redis channel "
+          f"{redis_channel} 发全量快照，均可动态更新；Ctrl+C 退出）\n")
 
     try:
         while True:
-            time.sleep(POLL_INTERVAL)
+            time.sleep(1)
+
+            # 1) 优先处理 Redis channel 下发的全量快照（只取最新一条）
+            snap = _drain_latest(_target_q)
+            if snap is not None:
+                src, want = snap
+                print(f"[{datetime.now():%H:%M:%S}] 收到 {src} 全量快照，重新对账监听名单...")
+                reconcile(wx, registered, want)
+                # 快照即当前真值：mtime 基准也刷新，避免紧接着又被 config.json 覆盖
+                try:
+                    last_mtime = os.path.getmtime(config_path)
+                except OSError:
+                    pass
+                print(f"  当前监听 {len(registered)} 个对象：{sorted(registered)}\n")
+                continue
+
+            # 2) 其次处理 config.json 变更（按 POLL_INTERVAL 节流）
+            now_ts = time.time()
+            if now_ts - last_cfg_check < POLL_INTERVAL:
+                continue
+            last_cfg_check = now_ts
             try:
                 mtime = os.path.getmtime(config_path)
             except OSError:
@@ -205,6 +270,10 @@ def main():
     except KeyboardInterrupt:
         print("\n收到退出信号，停止监听...")
     finally:
+        try:
+            control.stop()
+        except Exception:
+            pass
         try:
             wx.StopListening()
         except Exception:
