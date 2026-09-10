@@ -327,6 +327,8 @@ def do_send(wx, registered, cmd, max_delay_seconds):
     at = cmd.get("at") or None
     files = cmd.get("files") or None
 
+    print(f"  [at] cmd.get('at')={cmd.get('at')!r} -> at={at!r} (type={type(at).__name__})", flush=True)
+
     result = {
         "seq": seq,
         "appId": app_id,
