@@ -53,3 +53,15 @@ Every module has a `_base_dir()` that returns `os.path.dirname(sys.executable)` 
 
 ### Admin commands
 Sent as WeChat messages to the nickname in `config["admin"]`. `/指令` returns a category menu; each category command lists its details. Dispatch and handlers are `WXBot.process_command` and the `handle_*` methods.
+
+## Fork addition: Kafka / Redis bridge (`listen_whitelist.py`)
+
+A standalone program, separate from `web_server.py` / the panel — do not run both against the same WeChat account (wxautox listen conflict). Full spec in **`KAFKA_REDIS.md`**.
+
+- **`listen_whitelist.py`** — connects WeChat directly via `wxautox4` (no `WXBot`), runs a main loop; `import wxbot_core` only for its `WxParam` tuning, never instantiates `WXBotConfig`.
+- **`redis_control.py`** (`RedisListenControl`) — subscribes a Redis pub/sub channel; each message is a *full snapshot* `{"listen_list":[...], "group":[...]}` of who to listen to. Applied by the main thread (`reconcile`), then persisted to `listen_targets.json`.
+- **`kafka_sink.py`** (`KafkaSink`) — one Producer thread, `emit(payload, topic=?)`; sends received messages to the inbound topic and send-results to the result topic.
+- **`kafka_source.py`** (`KafkaSource`) — one Consumer thread (`auto.offset.reset=latest`), consumes send commands `{seq, appId, who, sendTime, text|files, at}`; `do_send()` validates + routes to `chat.SendMsg` / `wx.SendMsg`, always emits a result.
+- Config is **`listen_whitelist.json`** (script dir, gitignored; template `listen_whitelist.example.json`) — fully decoupled from `config/config.json`.
+- Threading rule: Redis/Kafka consumer threads only parse + enqueue (`queue.Queue`); all wxautox calls happen on the main thread.
+- `confluent-kafka` / `redis` missing → that piece degrades (KafkaSink dry-run prints; the others disable), main program still runs.
