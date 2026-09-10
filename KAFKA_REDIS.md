@@ -215,8 +215,19 @@ redis-cli -u redis://redis.mw.svc.dev.local:6379/0 \
 | `who` | **是** | 联系人或群名，需与微信里显示的会话名完全一致 |
 | `text` | 与 `files` 二选一 | 文本内容 |
 | `files` | 与 `text` 二选一 | list，图片/文件/视频路径 |
-| `at` | 否 | str 或 list，仅群聊有效 |
+| `at` | 否 | str 或 list，仅群聊有效。见下方「@ 注意事项」 |
 | `sendTime` | 建议带 | ISO8601（可带 `Z` / `+08:00`）或 epoch 秒 / 毫秒。**不带时区按本机本地时间解释** |
+
+**@ 注意事项**
+
+wxautox 的 `@` 是「输入 `@名字` → 等微信弹出的成员候选框 → 选中匹配项」。要 @ 成功：
+
+- `at` 的字符串必须**精确等于该成员在这个群里的显示名**（有群昵称就是群昵称，否则是微信昵称/备注）。名字对不上时 wxautox **不会报错**，只是把文本正常发出、不带 @。
+- 不能 @ 自己。
+- 该成员必须确实在群里、且候选框能搜到。
+- 慢机器上候选框还没渲染出来也会 @ 不上。
+
+排查：在群里手动打 `@` 看候选框里那个人显示成什么，用那个字符串。`AtAll` 是单独的 @全体成员方法（wxautox `wx.AtAll(msg, who)`），本程序未接。
 
 `Z` = UTC（零时区），`2026-09-10T09:00:00Z` ≡ `2026-09-10T17:00:00+08:00`。
 
@@ -284,6 +295,7 @@ sequenceDiagram
   "skipped": false,
   "error": null,
   "via": "mainwindow",
+  "resp": {"status": "success", "message": ""},
   "sendTime": "2026-09-10T17:00:00+08:00",
   "delaySeconds": 12.3,
   "ts": "2026-09-10T17:00:12"
@@ -295,10 +307,11 @@ sequenceDiagram
 | `seq` / `appId` / `sendTime` | 从指令原样回传 |
 | `bot` | 当前登录微信昵称 |
 | `who` | 目标会话名 |
-| `ok` | 是否真的调用 SendMsg 成功 |
-| `skipped` | `true` = 主动没发（校验失败 / 过期）；`false` 且 `ok=false` = 调了 SendMsg 但 wxautox 报错 |
-| `error` | 失败/拒绝原因，成功为 `null` |
+| `ok` | 取自 wxautox `SendMsg` 返回的 `WxResponse`（`was_send_success` 判定）。@ 不到人、切窗失败等 wxautox 报告的失败会使 `ok=false` |
+| `skipped` | `true` = 主动没发（校验失败 / 过期）；`false` 且 `ok=false` = 调了 SendMsg 但 wxautox 返回失败或抛异常 |
+| `error` | 失败/拒绝原因（wxautox 的 message 或异常 repr），成功为 `null` |
 | `via` | `subwindow` / `mainwindow` / `null`（未发送时） |
+| `resp` | wxautox `SendMsg` 的原始返回（`WxResponse` 转 dict / bool），用于排查 |
 | `delaySeconds` | `now - sendTime` 秒数，无法算时为 `null` |
 | `ts` | 结果生成时间 ISO8601 |
 
@@ -312,6 +325,7 @@ sequenceDiagram
 | 缺 `seq` / `appId` / `who` | true | false | `missing 'xxx'` |
 | `text`、`files` 都空 | true | false | `empty: no 'text' or 'files'` |
 | `sendTime` 过期 | true | false | `stale: delay Ns > Ms` |
+| wxautox 返回失败（如 @ 不到人、切窗失败） | false | false | wxautox 的 message（见 `resp`） |
 | 调 SendMsg 抛异常 | false | false | 异常 `repr` |
 
 ---

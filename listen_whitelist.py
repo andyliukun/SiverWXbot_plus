@@ -12,7 +12,8 @@
     sendTime 建议带（ISO8601 或 epoch 秒/毫秒）；距今超过 send_max_delay_seconds
     （默认 7200，即 2h）则不发
   - 每条指令始终回结果到 kafka_send_result_topic（校验失败/过期时 skipped=true）：
-    {"seq","appId","bot","who","ok","skipped","error","via","sendTime","delaySeconds","ts"}
+    {"seq","appId","bot","who","ok","skipped","error","via","resp","sendTime","delaySeconds","ts"}
+    ok 取自 wxautox 的返回（WxResponse），@ 不到人/切窗失败等会 ok=false
 不做任何 AI 回复 / 关键词 / 转发逻辑。
 
 配置文件 listen_whitelist.json（与本脚本同目录，独立于 config/config.json，
@@ -335,6 +336,7 @@ def do_send(wx, registered, cmd, max_delay_seconds):
         "skipped": False,          # True = 未发送（校验不过 / 过期）
         "error": None,
         "via": None,
+        "resp": None,              # wxautox SendMsg 的原始返回（WxResponse）
         "sendTime": send_time,
         "delaySeconds": None,
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -376,18 +378,22 @@ def do_send(wx, registered, cmd, max_delay_seconds):
     result["via"] = "subwindow" if sub else "mainwindow"
 
     try:
+        resp = None
         if files:
-            if sub:
-                sub.SendFiles(filepath=files)
-            else:
-                wx.SendFiles(who=who, filepath=files)
+            resp = sub.SendFiles(filepath=files) if sub else wx.SendFiles(who=who, filepath=files)
         if text:
             if sub:
-                sub.SendMsg(msg=text, at=at) if at else sub.SendMsg(text)
+                resp = sub.SendMsg(msg=text, at=at) if at else sub.SendMsg(text)
             else:
-                wx.SendMsg(msg=text, who=who, at=at) if at else wx.SendMsg(msg=text, who=who)
-        result["ok"] = True
-        print(f"  → 已发送到 {who}（{result['via']}）: text={text!r} at={at} files={files}", flush=True)
+                resp = wx.SendMsg(msg=text, who=who, at=at) if at else wx.SendMsg(msg=text, who=who)
+        # wxautox 返回 WxResponse(dict)，据此判断真实成败（@ 不到人/切窗失败等）
+        ok = wxbot_core.ReplyCountStore.was_send_success(resp) if resp is not None else True
+        result["ok"] = ok
+        if not ok:
+            result["error"] = wxbot_core.ReplyCountStore.send_result_message(resp)
+        result["resp"] = resp.to_dict() if hasattr(resp, "to_dict") else resp
+        flag = "→ 已发送" if ok else "! 发送返回失败"
+        print(f"  {flag} {who}（{result['via']}）: text={text!r} at={at} files={files} resp={result['resp']}", flush=True)
     except Exception as e:
         result["error"] = repr(e)
         print(f"  ! 发送到 {who} 失败: {e!r}", flush=True)
