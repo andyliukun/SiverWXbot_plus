@@ -262,6 +262,7 @@ class WXBotConfig:
         self.new_frined_switch = False        # 自动通过新好友开关
         self.new_frien_reply_switch = False   # 新好友自动回复开关
         self.new_frien_msg = []               # 通过后自动发送的打招呼消息列表
+        self.new_friend_keywords = []         # 申请验证消息关键词白名单，空=全部通过
         self.new_friend_remark_use_nickname = True
         self.new_friend_remark_prefix_timestamp = False
         self.new_friend_remark_suffix_timestamp = False
@@ -377,6 +378,7 @@ class WXBotConfig:
                     "new_friend_remark_suffix": "_机器人备注",
                     "new_friend_remark_suffix_timestamp": False,
                     "new_friend_tags": [],
+                    "new_friend_keywords": [],
                     "chat_keyword_switch": False,
                     "group_keyword_switch": False,
                     "group_keyword_at_only": False,
@@ -599,6 +601,9 @@ class WXBotConfig:
         self.new_friend_remark_suffix = self.config.get('new_friend_remark_suffix', '_机器人备注')
         self.new_friend_remark_suffix_timestamp = bool(self.config.get('new_friend_remark_suffix_timestamp', False))
         self.new_friend_tags         = self.config.get('new_friend_tags', [])
+        self.new_friend_keywords     = [
+            str(k).strip() for k in (self.config.get('new_friend_keywords') or []) if str(k).strip()
+        ]
 
         # 关键词配置
         self.chat_keyword_switch   = self.config.get('chat_keyword_switch')
@@ -4439,17 +4444,25 @@ class WXBot:
         检测并批量通过新好友请求，通过后按需自动发送打招呼消息。
         - new_friend_switch：自动通过新好友申请
         - new_friend_reply_switch：通过后自动回复消息
+        - new_friend_keywords：申请验证消息关键词白名单，非空时只通过含任一关键词的申请
         消息中若包含图片路径则以文件形式发送，否则以文字发送。
         """
         NewFriends = self.wx.GetNewFriends(acceptable=True)
         time.sleep(1)
         if len(NewFriends) != 0:
             log(message="以下是新朋友：\n" + str(NewFriends))
+            keywords = self.config.new_friend_keywords
             for new in NewFriends:
+                # 关键词过滤：配置了关键词且申请验证消息不含任一关键词 → 跳过（不通过也不删除）
+                verify_msg = str(getattr(new, "content", "") or "")
+                if keywords and not any(kw in verify_msg for kw in keywords):
+                    log(message=f"跳过 {new.name} 的好友请求：验证消息 {verify_msg!r} 未命中关键词 {keywords}")
+                    continue
                 new_name = self.build_new_friend_remark(new.name)
                 tags = self.config.new_friend_tags if self.config.new_friend_tags else None
                 new.accept(remark=new_name, tags=tags)  # 接受好友请求并设置备注和标签
-                log(message="已通过" + new_name + "的好友请求")
+                log(message="已通过" + new_name + "的好友请求"
+                    + (f"（命中关键词，验证消息：{verify_msg!r}）" if keywords else ""))
                 self.wx.SwitchToChat()       # 通过请求后切换回聊天页面
                 time.sleep(5)
                 if self.config.new_frien_reply_switch:
