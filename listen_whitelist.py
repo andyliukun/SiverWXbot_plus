@@ -211,6 +211,24 @@ def on_message(msg, chat):
     who = getattr(chat, 'who', '?')
     # attr: friend=别人发来  self=自己发的(多端同步)  system=系统消息
 
+    # 图片/引用图片下载：与 wxbot_core.message_handle_callback 同一模式，
+    # 直接在回调里调用（回调本身即 wxautox 的监听线程，非主循环），
+    # 下载后用本地路径覆盖 content，异常吞掉避免打断整个监听
+    try:
+        if msg.type == 'image':
+            _down_path = msg.download()
+            if _down_path:
+                msg.content = str(_down_path)
+                # TODO  上传OSS
+            else:
+                print(f"[on_message] 图片下载失败 chat={who} msg_id={getattr(msg, 'id', None)}", flush=True)
+        elif msg.type == 'quote':
+            _down_path = msg.download_quote_image()
+            if _down_path:
+                msg.content = msg.content + "+引用的图片:" + str(_down_path)
+    except Exception as e:
+        print(f"[on_message] 下载图片出错: {e!r}", flush=True)
+
     # 投递到 Kafka：非阻塞、异常不外抛（否则 wxautox 回调出错会停掉整个监听）
     if _sink is not None:
         try:
