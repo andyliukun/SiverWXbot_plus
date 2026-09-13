@@ -23,6 +23,7 @@ __pycache__/
 /config/
 /listen_whitelist.json
 /listen_targets.json
+/oss_test_config.json
 logs/
 wxauto_logs/
 panel_logs/

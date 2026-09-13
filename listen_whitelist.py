@@ -27,9 +27,26 @@
     "send_max_delay_seconds":   7200,   # sendTime 距今超过则不发（仍回结果）
     "redis_url":                "redis://redis.mw.svc.dev.local:6379/0",
     "redis_listen_channel":     "com.jsecode.wxbot.listen.update",
-    "redis_password":           ""      # 也可直接写进 redis_url: redis://:pass@host:6379/0
+    "redis_password":           "",     # 也可直接写进 redis_url: redis://:pass@host:6379/0
+    "oss_access_key_id":        "",
+    "oss_access_key_secret":    "",
+    "oss_endpoint":             "",     # 如 https://oss-cn-hangzhou.aliyuncs.com
+    "oss_bucket_name":          "",
+    "oss_proxy_base_url":       "",     # 反代域名，非空则把签名 URL 的 host 换成它
+    "oss_url_expire_seconds":   604800, # 签名 URL 有效期，默认 7 天
+    "new_friend_switch":        false,  # 自动通过新好友申请
+    "new_friend_check_min":     60,     # 检查间隔下限（秒），随机取 [min, max]
+    "new_friend_check_max":     300,    # 检查间隔上限（秒）
+    "new_friend_keywords":      [],     # 申请验证消息关键词白名单，空=全部通过
+    "new_friend_welcome_msg":   []      # 通过后依次发送的打招呼文本，空=不发
   }
 缺失的键用脚本内默认值。样板见 listen_whitelist.example.json。
+oss_access_key_id / oss_access_key_secret / oss_endpoint / oss_bucket_name 任一缺失，
+或未安装 oss2（pip install oss2），图片上传 OSS 功能整体禁用，退回本地路径。
+
+自动通过新好友：主循环里按随机间隔（new_friend_check_min ~ new_friend_check_max 秒）
+调用 wxautox4 的 GetNewFriends(acceptable=True) + accept()，与主程序 wxbot_core.py 的
+Pass_New_Friends 同一模式，但不做备注模板/标签，直接以对方昵称作为备注。
 
 监听名单不来自任何配置文件：
   - 唯一来源是 Redis channel 下发的「全量快照」JSON：
@@ -49,10 +66,13 @@ Ctrl+C 退出。
 import json
 import os
 import queue
+import random
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
 # import wxbot_core 只为触发它对 wxautox 的 WxParam 调优（MESSAGE_HASH /
 # CHAT_WINDOW_SIZE 等），与主程序行为一致。不实例化 WXBotConfig，不碰 config.json。
@@ -60,6 +80,11 @@ import wxbot_core  # noqa: F401
 
 # 直接使用 wxautox4，不走 WXBot 那套 AI/指令流水线
 from wxautox4 import WeChat
+
+try:
+    import oss2
+except ImportError:  # 允许没装 oss2 时脚本仍能跑（图片上传 OSS 功能整体禁用）
+    oss2 = None
 
 from kafka_sink import KafkaSink
 from kafka_source import KafkaSource
@@ -87,10 +112,28 @@ DEFAULTS = {
     "redis_url": "redis://redis.mw.svc.dev.local:6379/0",
     "redis_listen_channel": "com.jsecode.wxbot.listen.update",
     "redis_password": "",
+    "oss_access_key_id": "",
+    "oss_access_key_secret": "",
+    "oss_endpoint": "",
+    "oss_bucket_name": "",
+    "oss_proxy_base_url": "",
+    "oss_url_expire_seconds": 7 * 24 * 60 * 60,   # 签名 URL 默认有效期：7 天
+    "new_friend_switch": False,
+    "new_friend_check_min": 60,
+    "new_friend_check_max": 300,
+    "new_friend_keywords": [],
+    "new_friend_welcome_msg": [],
 }
+
+# 新好友检测在主循环里按 tick 计数触发，tick 周期与主循环 time.sleep() 一致
+NEW_FRIEND_CHECK_TICK_SECONDS = 0.5
 
 _sink = None          # KafkaSink 实例，main() 里初始化
 _bot_id = "?"         # 当前登录微信昵称，main() 里赋值
+
+_oss_bucket = None                                        # oss2.Bucket 实例；None 表示上传功能禁用
+_oss_proxy_base_url = ""                                   # 反代域名，非空则替换签名 URL 的 host
+_oss_url_expire_seconds = DEFAULTS["oss_url_expire_seconds"]
 
 # Redis channel 下发的全量快照队列：订阅线程写，主线程读后 reconcile + 落盘
 # （wxautox 的 AddListenChat/RemoveListenChat 必须在持有 WeChat 对象的主线程调）
@@ -189,6 +232,46 @@ def save_state(path, listen_list, group):
             pass
 
 
+# ---------------- OSS 上传 ----------------
+
+def build_oss_bucket(cfg):
+    """按配置初始化 oss2.Bucket；未装 oss2 或配置不全则返回 None（上传功能整体禁用）。"""
+    if oss2 is None:
+        print("[oss] 未安装 oss2（pip install oss2），跳过图片上传 OSS", flush=True)
+        return None
+    ak = str(cfg.get("oss_access_key_id") or "").strip()
+    sk = str(cfg.get("oss_access_key_secret") or "").strip()
+    endpoint = str(cfg.get("oss_endpoint") or "").strip()
+    bucket_name = str(cfg.get("oss_bucket_name") or "").strip()
+    if not all((ak, sk, endpoint, bucket_name)):
+        print("[oss] oss_access_key_id/oss_access_key_secret/oss_endpoint/oss_bucket_name "
+              "未配置完整，跳过图片上传 OSS", flush=True)
+        return None
+    return oss2.Bucket(oss2.Auth(ak, sk), endpoint, bucket_name)
+
+
+def _oss_rehost(url, proxy_base_url):
+    """把签名 URL 的 scheme+host 换成反代域名，保留 path 和签名 query 不变。"""
+    parts = urlsplit(url)
+    proxy_parts = urlsplit(proxy_base_url)
+    return urlunsplit((proxy_parts.scheme, proxy_parts.netloc, parts.path, parts.query, ""))
+
+
+def upload_to_oss(bucket, local_path, proxy_base_url, expires):
+    """上传本地文件到 OSS，返回签名访问 URL；失败返回 None（不抛出，调用方退回本地路径）。"""
+    ext = os.path.splitext(local_path)[1]
+    object_key = f"wxbot/{datetime.now():%Y%m%d}/{uuid.uuid4().hex}{ext}"
+    try:
+        bucket.put_object_from_file(object_key, local_path)
+        url = bucket.sign_url("GET", object_key, expires)
+        if proxy_base_url:
+            url = _oss_rehost(url, proxy_base_url)
+        return url
+    except Exception as e:
+        print(f"[oss] 上传失败 {local_path}: {e!r}", flush=True)
+        return None
+
+
 # ---------------- 微信 / 监听 ----------------
 
 def connect_wechat():
@@ -218,8 +301,16 @@ def on_message(msg, chat):
         if msg.type == 'image':
             _down_path = msg.download()
             if _down_path:
-                msg.content = str(_down_path)
-                # TODO  上传OSS
+                local_path = str(_down_path)
+                msg.content = local_path
+                if _oss_bucket is not None:
+                    url = upload_to_oss(_oss_bucket, local_path, _oss_proxy_base_url, _oss_url_expire_seconds)
+                    if url:
+                        msg.content = url
+                        try:
+                            os.remove(local_path)
+                        except OSError as e:
+                            print(f"[on_message] 上传 OSS 成功但删除本地文件失败 {local_path}: {e!r}", flush=True)
             else:
                 print(f"[on_message] 图片下载失败 chat={who} msg_id={getattr(msg, 'id', None)}", flush=True)
         elif msg.type == 'quote':
@@ -278,6 +369,39 @@ def remove_listen(wx, name):
         print(f"  - 已取消监听 {name}")
     except Exception as e:
         print(f"  ! 取消监听失败 {name}: {e!r}")
+
+
+def pass_new_friends(wx, keywords, welcome_msg):
+    """检测并批量通过新好友请求，通过后按需发送打招呼消息（只在主线程调，UI/COM 操作）。
+    与 wxbot_core.py 的 Pass_New_Friends 同一模式，但不做备注模板/标签，直接用对方昵称做备注。
+    :param keywords: 申请验证消息关键词白名单，非空时只通过命中任一关键词的申请，未命中的跳过
+    :param welcome_msg: 通过后依次发送的打招呼文本列表，空则不发
+    """
+    new_friends = wx.GetNewFriends(acceptable=True)
+    time.sleep(1)
+    if not new_friends:
+        return
+    print(f"[new_friend] 待处理新好友请求 {len(new_friends)} 个", flush=True)
+    for new in new_friends:
+        verify_msg = str(getattr(new, "content", "") or "")
+        if keywords and not any(kw in verify_msg for kw in keywords):
+            print(f"[new_friend] 跳过 {new.name}：验证消息 {verify_msg!r} 未命中关键词 {keywords}", flush=True)
+            continue
+        try:
+            new.accept(remark=new.name)
+        except Exception as e:
+            print(f"[new_friend] 通过 {new.name} 的好友请求失败: {e!r}", flush=True)
+            continue
+        print(f"[new_friend] 已通过 {new.name} 的好友请求"
+              + (f"（命中关键词，验证消息：{verify_msg!r}）" if keywords else ""), flush=True)
+        wx.SwitchToChat()   # 通过请求后切换回聊天页面
+        time.sleep(5)
+        for msg in welcome_msg:
+            try:
+                wx.SendMsg(who=new.name, msg=msg)
+            except Exception as e:
+                print(f"[new_friend] 发送打招呼消息给 {new.name} 失败: {e!r}", flush=True)
+            time.sleep(1)
 
 
 def _drain_latest(q):
@@ -421,7 +545,7 @@ def do_send(wx, registered, cmd, max_delay_seconds):
 
 
 def main():
-    global _sink, _bot_id
+    global _sink, _bot_id, _oss_bucket, _oss_proxy_base_url, _oss_url_expire_seconds
 
     cfg = load_config()
     state_path = STATE_PATH
@@ -437,6 +561,35 @@ def main():
     wx = connect_wechat()
     _bot_id = wx.nickname
     print(f"已连接微信：{wx.nickname}")
+
+    _oss_bucket = build_oss_bucket(cfg)
+    _oss_proxy_base_url = str(cfg.get("oss_proxy_base_url") or "").strip().rstrip("/")
+    try:
+        _oss_url_expire_seconds = int(cfg.get("oss_url_expire_seconds") or DEFAULTS["oss_url_expire_seconds"])
+    except (TypeError, ValueError):
+        _oss_url_expire_seconds = DEFAULTS["oss_url_expire_seconds"]
+    if _oss_bucket is not None:
+        print(f"OSS -> bucket={cfg.get('oss_bucket_name')}  "
+              f"proxy={_oss_proxy_base_url or '(无，直接用 OSS 签名域名)'}  "
+              f"expire={_oss_url_expire_seconds}s")
+
+    new_friend_switch = bool(cfg.get("new_friend_switch"))
+    try:
+        new_friend_check_min = max(10, int(cfg.get("new_friend_check_min") or DEFAULTS["new_friend_check_min"]))
+    except (TypeError, ValueError):
+        new_friend_check_min = DEFAULTS["new_friend_check_min"]
+    try:
+        new_friend_check_max = max(new_friend_check_min, int(cfg.get("new_friend_check_max") or DEFAULTS["new_friend_check_max"]))
+    except (TypeError, ValueError):
+        new_friend_check_max = max(new_friend_check_min, DEFAULTS["new_friend_check_max"])
+    new_friend_keywords = [str(k).strip() for k in (cfg.get("new_friend_keywords") or []) if str(k).strip()]
+    new_friend_welcome_msg = [str(m) for m in (cfg.get("new_friend_welcome_msg") or []) if str(m).strip()]
+    new_friend_check_ticks_min = max(1, int(new_friend_check_min / NEW_FRIEND_CHECK_TICK_SECONDS))
+    new_friend_check_ticks_max = max(new_friend_check_ticks_min, int(new_friend_check_max / NEW_FRIEND_CHECK_TICK_SECONDS))
+    new_friend_counter = 0
+    if new_friend_switch:
+        print(f"新好友自动通过 -> 开启  间隔 {new_friend_check_min}-{new_friend_check_max}s  "
+              f"关键词过滤={new_friend_keywords or '（无，全部通过）'}  打招呼消息条数={len(new_friend_welcome_msg)}")
 
     brokers, topic, send_topic, send_result_topic, group_id = kafka_settings(cfg)
     try:
@@ -478,7 +631,17 @@ def main():
 
     try:
         while True:
-            time.sleep(0.5)
+            time.sleep(NEW_FRIEND_CHECK_TICK_SECONDS)
+
+            # 0) 新好友自动通过（随机间隔，避免每 tick 都调用 UI/COM 接口）
+            if new_friend_switch:
+                new_friend_counter += 1
+                if new_friend_counter >= random.randint(new_friend_check_ticks_min, new_friend_check_ticks_max):
+                    try:
+                        pass_new_friends(wx, new_friend_keywords, new_friend_welcome_msg)
+                    except Exception as e:
+                        print(f"[new_friend] 检查新好友出错: {e!r}", flush=True)
+                    new_friend_counter = 0
 
             # 1) Redis 全量快照 -> reconcile 监听名单 + 落盘
             snap = _drain_latest(_target_q)

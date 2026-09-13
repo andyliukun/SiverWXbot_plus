@@ -7,5 +7,16 @@
     "send_max_delay_seconds": 7200,
     "redis_url": "redis://redis.mw.svc.dev.local:6379/0",
     "redis_listen_channel": "com.jsecode.wxbot.listen.update",
-    "redis_password": ""
+    "redis_password": "",
+    "oss_access_key_id": "",
+    "oss_access_key_secret": "",
+    "oss_endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+    "oss_bucket_name": "",
+    "oss_proxy_base_url": "",
+    "oss_url_expire_seconds": 604800,
+    "new_friend_switch": false,
+    "new_friend_check_min": 60,
+    "new_friend_check_max": 300,
+    "new_friend_keywords": [],
+    "new_friend_welcome_msg": []
 }

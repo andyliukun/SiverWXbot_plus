@@ -8,3 +8,4 @@ cozepy
 websockets
 confluent-kafka
 redis
+oss2
